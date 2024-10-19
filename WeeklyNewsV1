@@ -1,0 +1,198 @@
+import os
+import requests
+import time
+from googleapiclient.discovery import build
+from yt_dlp import YoutubeDL
+from dotenv import load_dotenv
+import glob
+import re
+import shutil
+
+# Load environment variables from .env file
+load_dotenv()
+
+# API keys and paths
+YOUTUBE_API_KEY = "API KEY" # Replace with your actual YouTube API key
+ASSEMBLYAI_API_KEY =  "API KEY" # Replace with your actual AssemblyAI API key
+TARGET_FOLDER_PATH = "FOLDER_PATH"  # Updated OneDrive folder path
+TEMP_AUDIO_PATH = os.path.join(TARGET_FOLDER_PATH, "TEMP_FOLDER_AUDIO")  # Temporary folder for audio downloads
+TRANSCRIPTIONS_PATH = os.path.join(TARGET_FOLDER_PATH, "TEMP_FOLDER_TRANSCRIPTIONS")  # Folder for transcriptions
+
+# Ensure the output paths exist
+os.makedirs(TEMP_AUDIO_PATH, exist_ok=True)
+os.makedirs(TRANSCRIPTIONS_PATH, exist_ok=True)
+
+# Function to clean up the output directories
+def clean_output_directories():
+    for dir_path in [TEMP_AUDIO_PATH, TRANSCRIPTIONS_PATH]:
+        for filename in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                    print(f"Deleted file: {file_path}")
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+                    print(f"Deleted directory: {file_path}")
+            except Exception as e:
+                print(f"Failed to delete {file_path}. Reason: {e}")
+
+# YouTube playlist ID
+PLAYLIST_ID = 'PLAYLIST_ID'  # Your playlist ID in order to get the newest videos
+
+# yt-dlp options (defined globally)
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'outtmpl': os.path.join(TEMP_AUDIO_PATH, '%(title)s.%(ext)s'),
+    'ffmpeg_location': 'ffmpeg_location_path',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+    'retries': 5,                # Increased retries to handle transient issues
+    'socket_timeout': 30,        # Set socket timeout to 30 seconds
+    'quiet': False,              # Enable output to see detailed logs
+    'no_warnings': False,        # Show warnings to help diagnose issues
+}
+
+# Function to sanitize filenames
+def sanitize_filename(name):
+    # Remove or replace characters that are invalid in filenames
+    return re.sub(r'[\\/*?:"<>|]', '_', name)
+
+# Function to get the last N videos from a playlist
+def get_videos_from_playlist(playlist_id, max_results=7):
+    youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+
+    video_ids = []
+    video_titles = []
+
+    next_page_token = None
+
+    while True:
+        request = youtube.playlistItems().list(
+            part="snippet",
+            playlistId=playlist_id,
+            maxResults=50,
+            pageToken=next_page_token
+        )
+        response = request.execute()
+
+        for item in response['items']:
+            video_id = item['snippet']['resourceId']['videoId']
+            title = item['snippet']['title']
+            video_ids.append(video_id)
+            video_titles.append(title)
+
+        next_page_token = response.get('nextPageToken')
+
+        if not next_page_token:
+            break
+
+    # Take the last 'max_results' videos
+    video_ids = video_ids[-max_results:]
+    video_titles = video_titles[-max_results:]
+
+    return [{'video_id': vid, 'title': title} for vid, title in zip(video_ids, video_titles)]
+
+# Function to download audio using yt-dlp
+def download_audio(video_url):
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        # After download and conversion, find the corresponding mp3 file
+        mp3_files = glob.glob(os.path.join(TEMP_AUDIO_PATH, '*.mp3'))
+        if not mp3_files:
+            print(f"No mp3 file found after downloading {video_url}")
+            return None
+        # Assuming the last file is the one just downloaded
+        latest_mp3 = max(mp3_files, key=os.path.getctime)
+        return latest_mp3
+    except Exception as e:
+        print(f"An error occurred while downloading {video_url}: {str(e)}")
+        return None
+
+# Function to transcribe audio using AssemblyAI
+def transcribe_audio(audio_path):
+    headers = {'authorization': ASSEMBLYAI_API_KEY}
+
+    # Upload the audio file to AssemblyAI
+    upload_url = "https://api.assemblyai.com/v2/upload"
+    with open(audio_path, 'rb') as audio_file:
+        upload_response = requests.post(upload_url, headers=headers, files={"file": audio_file})
+    upload_response.raise_for_status()
+    audio_url = upload_response.json()['upload_url']
+
+    # Request transcription
+    transcript_url = "https://api.assemblyai.com/v2/transcript"
+    transcript_request = {
+        'audio_url': audio_url,
+        'language_code': 'de',  # Set the language code to German
+        'language_model': 'assemblyai_default',  # Optionally specify model
+        'auto_chapters': False,  # Disable chapters if not needed
+        'punctuate': True,  # Enable punctuation
+        'format_text': True,  # Enable formatting
+    }
+    transcript_response = requests.post(transcript_url, headers=headers, json=transcript_request)
+    transcript_response.raise_for_status()
+    transcript_id = transcript_response.json()['id']
+
+    # Poll for transcription result
+    while True:
+        transcript_result = requests.get(f"{transcript_url}/{transcript_id}", headers=headers)
+        transcript_result.raise_for_status()
+        result = transcript_result.json()
+        if result['status'] == 'completed':
+            return result['text']
+        elif result['status'] == 'failed':
+            raise Exception("Transcription failed")
+        print(f"Transcription status: {result['status']}")
+        time.sleep(10)
+
+# Function to save transcription to a text file
+def save_transcription(transcription, video_title):
+    sanitized_title = sanitize_filename(video_title)
+    txt_filename = f"{sanitized_title}.txt"
+    txt_filepath = os.path.join(TRANSCRIPTIONS_PATH, txt_filename)
+    with open(txt_filepath, 'w', encoding='utf-8') as f:
+        f.write(transcription)
+    print(f"Transcription saved to {txt_filepath}")
+
+# Function to fetch videos and transcribe them
+def fetch_videos_and_transcribe():
+    print(f"\nProcessing playlist ID: {PLAYLIST_ID}")
+    videos = get_videos_from_playlist(PLAYLIST_ID, max_results=7)
+    if not videos:
+        print(f"No videos found for playlist ID: {PLAYLIST_ID}")
+        return
+    for video in videos:
+        video_url = f"https://www.youtube.com/watch?v={video['video_id']}"
+        print(f"\nDownloading and transcribing: {video['title']}")
+
+        # Download the video audio
+        audio_file = download_audio(video_url)
+
+        if audio_file:
+            # Transcribe the audio
+            try:
+                transcription = transcribe_audio(audio_file)
+                # Save transcription to a text file
+                save_transcription(transcription, video['title'])
+            except Exception as e:
+                print(f"An error occurred while transcribing {video['title']}: {str(e)}")
+            finally:
+                # Clean up the downloaded audio file
+                try:
+                    os.remove(audio_file)
+                    print(f"Removed temporary audio file: {audio_file}")
+                except Exception as e:
+                    print(f"Could not remove temporary audio file {audio_file}: {str(e)}")
+
+    print(f"\nAll transcriptions saved to {TRANSCRIPTIONS_PATH}")
+
+# Main execution
+if __name__ == "__main__":
+    clean_output_directories()
+    fetch_videos_and_transcribe()
